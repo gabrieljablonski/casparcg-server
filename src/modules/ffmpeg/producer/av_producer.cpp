@@ -40,6 +40,7 @@ extern "C" {
 #include <libavutil/opt.h>
 #include <libavutil/pixfmt.h>
 #include <libavutil/samplefmt.h>
+#include <libavutil/hwcontext.h>
 }
 #ifdef _MSC_VER
 #pragma warning(pop)
@@ -60,6 +61,8 @@ extern "C" {
 namespace caspar { namespace ffmpeg {
 
 const AVRational TIME_BASE_Q = {1, AV_TIME_BASE};
+
+static enum AVPixelFormat hw_pix_fmt = AV_PIX_FMT_VAAPI;
 
 struct Frame
 {
@@ -85,6 +88,17 @@ struct Decoder
 
     Decoder() = default;
 
+    static enum AVPixelFormat get_hw_format(AVCodecContext *ctx,
+                                            const enum AVPixelFormat *pix_fmts)
+    {
+        const enum AVPixelFormat *p;
+        for (p = pix_fmts; *p != -1; p++) {
+            if (*p == hw_pix_fmt)
+                return *p;
+        }
+        return AV_PIX_FMT_NONE;
+    }
+
     explicit Decoder(AVStream* stream)
         : st(stream)
     {
@@ -102,7 +116,13 @@ struct Decoder
 
         FF(avcodec_parameters_to_context(ctx.get(), stream->codecpar));
 
+        ctx->get_format = get_hw_format;
+        ctx->pix_fmt = AV_PIX_FMT_YUV420P;
         FF(av_opt_set_int(ctx.get(), "refcounted_frames", 1, 0));
+
+        static AVBufferRef *hw_device_ctx = NULL;
+        FF(av_hwdevice_ctx_create(&hw_device_ctx, AV_HWDEVICE_TYPE_VAAPI, "/dev/dri/renderD128", NULL, 0));
+        ctx->hw_device_ctx = av_buffer_ref(hw_device_ctx);
 
         int numThreads = 1;
         if (codec->capabilities & AV_CODEC_CAP_AUTO_THREADS) {
@@ -143,7 +163,10 @@ struct Decoder
             return false;
         }
 
+        std::shared_ptr<AVFrame> tmp_frame = NULL;
         auto av_frame = alloc_frame();
+        auto sw_frame = alloc_frame();
+
         auto ret      = avcodec_receive_frame(ctx.get(), av_frame.get());
 
         if (ret == AVERROR(EAGAIN)) {
@@ -161,15 +184,22 @@ struct Decoder
         } else {
             FF_RET(ret, "avcodec_receive_frame");
 
+            if (av_frame->format == hw_pix_fmt) {
+                /* retrieve data from GPU to CPU */
+                FF(av_hwframe_transfer_data(sw_frame.get(), av_frame.get(), 0));
+                tmp_frame = sw_frame;
+            } else
+                tmp_frame = av_frame;
+            tmp_frame->format = AV_PIX_FMT_YUV420P;
             // NOTE This is a workaround for DVCPRO HD.
-            if (av_frame->width > 1024 && av_frame->interlaced_frame) {
-                av_frame->top_field_first = 1;
+            if (tmp_frame->width > 1024 && tmp_frame->interlaced_frame) {
+                tmp_frame->top_field_first = 1;
             }
 
             // TODO (fix) is this always best?
-            av_frame->pts = av_frame->best_effort_timestamp;
+            tmp_frame->pts = tmp_frame->best_effort_timestamp;
 
-            auto duration_pts = av_frame->pkt_duration;
+            auto duration_pts = tmp_frame->pkt_duration;
             if (duration_pts <= 0) {
                 if (ctx->codec_type == AVMEDIA_TYPE_VIDEO) {
                     const auto ticks =
@@ -178,17 +208,17 @@ struct Decoder
                                    ctx->framerate.num / ctx->ticks_per_frame;
                     duration_pts = av_rescale_q(duration_pts, {1, AV_TIME_BASE}, st->time_base);
                 } else if (ctx->codec_type == AVMEDIA_TYPE_AUDIO) {
-                    duration_pts = av_rescale_q(av_frame->nb_samples, {1, ctx->sample_rate}, st->time_base);
+                    duration_pts = av_rescale_q(tmp_frame->nb_samples, {1, ctx->sample_rate}, st->time_base);
                 }
             }
 
             if (duration_pts > 0) {
-                next_pts = av_frame->pts + duration_pts;
+                next_pts = tmp_frame->pts + duration_pts;
             } else {
                 next_pts = AV_NOPTS_VALUE;
             }
 
-            frame = std::move(av_frame);
+            frame = std::move(tmp_frame);
         }
 
         return true;
