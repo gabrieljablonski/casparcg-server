@@ -20,6 +20,7 @@
 #include <common/os/thread.h>
 #include <common/scope_exit.h>
 #include <common/timer.h>
+#include <common/log.h>
 
 #include <core/frame/draw_frame.h>
 #include <core/frame/frame_factory.h>
@@ -77,6 +78,7 @@ struct Frame
 // TODO (fix) Handle ts discontinuities.
 // TODO (feat) Forward options.
 
+
 struct Decoder
 {
     AVStream*                             st = nullptr;
@@ -96,16 +98,19 @@ struct Decoder
             if (*p == hw_pix_fmt)
                 return *p;
         }
+        CASPAR_LOG(error) << "Failed to get HW surface format.";
         return AV_PIX_FMT_NONE;
     }
 
     explicit Decoder(AVStream* stream)
         : st(stream)
     {
+        CASPAR_LOG(info) << "1";
         const auto codec = avcodec_find_decoder(stream->codecpar->codec_id);
         if (!codec) {
             FF_RET(AVERROR_DECODER_NOT_FOUND, "avcodec_find_decoder");
         }
+        CASPAR_LOG(info) << "2";
 
         ctx = std::shared_ptr<AVCodecContext>(avcodec_alloc_context3(codec),
                                               [](AVCodecContext* ptr) { avcodec_free_context(&ptr); });
@@ -113,11 +118,11 @@ struct Decoder
         if (!ctx) {
             FF_RET(AVERROR(ENOMEM), "avcodec_alloc_context3");
         }
+        CASPAR_LOG(info) << "3";
 
         FF(avcodec_parameters_to_context(ctx.get(), stream->codecpar));
 
         ctx->get_format = get_hw_format;
-        ctx->pix_fmt = AV_PIX_FMT_YUV420P;
         FF(av_opt_set_int(ctx.get(), "refcounted_frames", 1, 0));
 
         static AVBufferRef *hw_device_ctx = NULL;
@@ -153,6 +158,7 @@ struct Decoder
         if (codec->capabilities & AV_CODEC_CAP_SLICE_THREADS) {
             ctx->thread_type = FF_THREAD_SLICE;
         }
+        CASPAR_LOG(info) << "4";
 
         FF(avcodec_open2(ctx.get(), codec, nullptr));
     }
@@ -162,44 +168,59 @@ struct Decoder
         if (frame || eof || !st) {
             return false;
         }
+        // CASPAR_LOG(info) << "5";
 
-        std::shared_ptr<AVFrame> tmp_frame = NULL;
         auto av_frame = alloc_frame();
         auto sw_frame = alloc_frame();
 
+        av_frame->format = sw_frame->format = AV_PIX_FMT_YUV420P;
+
         auto ret      = avcodec_receive_frame(ctx.get(), av_frame.get());
+        // CASPAR_LOG(info) << "6: " << ret;
 
         if (ret == AVERROR(EAGAIN)) {
+            // CASPAR_LOG(info) << "7";
             if (input.empty()) {
                 return false;
             }
+            // CASPAR_LOG(info) << "8";
             FF(avcodec_send_packet(ctx.get(), input.front().get()));
             input.pop();
+            // CASPAR_LOG(info) << "9";
         } else if (ret == AVERROR_EOF) {
+            // CASPAR_LOG(info) << "10";
             avcodec_flush_buffers(ctx.get());
             av_frame->pts = next_pts;
             eof           = true;
             next_pts      = AV_NOPTS_VALUE;
             frame         = std::move(av_frame);
+            // CASPAR_LOG(info) << "11";
         } else {
+            // CASPAR_LOG(info) << "12";
             FF_RET(ret, "avcodec_receive_frame");
 
             if (av_frame->format == hw_pix_fmt) {
                 /* retrieve data from GPU to CPU */
+                // CASPAR_LOG(info) << "12.1";
                 FF(av_hwframe_transfer_data(sw_frame.get(), av_frame.get(), 0));
-                tmp_frame = sw_frame;
-            } else
-                tmp_frame = av_frame;
-            tmp_frame->format = AV_PIX_FMT_YUV420P;
-            // NOTE This is a workaround for DVCPRO HD.
-            if (tmp_frame->width > 1024 && tmp_frame->interlaced_frame) {
-                tmp_frame->top_field_first = 1;
+                FF(av_frame_copy_props(sw_frame.get(), av_frame.get()));
+
+                av_frame_unref(av_frame.get());
+                av_frame_move_ref(av_frame.get(), sw_frame.get());
+
+                // CASPAR_LOG(info) << "12.2";
             }
 
-            // TODO (fix) is this always best?
-            tmp_frame->pts = tmp_frame->best_effort_timestamp;
+            // NOTE This is a workaround for DVCPRO HD.
+            if (av_frame->width > 1024 && av_frame->interlaced_frame) {
+                av_frame->top_field_first = 1;
+            }
+            // CASPAR_LOG(info) << "12.3";
 
-            auto duration_pts = tmp_frame->pkt_duration;
+            // TODO (fix) is this always best?
+            av_frame->pts = av_frame->best_effort_timestamp;
+
+            auto duration_pts = av_frame->pkt_duration;
             if (duration_pts <= 0) {
                 if (ctx->codec_type == AVMEDIA_TYPE_VIDEO) {
                     const auto ticks =
@@ -208,17 +229,17 @@ struct Decoder
                                    ctx->framerate.num / ctx->ticks_per_frame;
                     duration_pts = av_rescale_q(duration_pts, {1, AV_TIME_BASE}, st->time_base);
                 } else if (ctx->codec_type == AVMEDIA_TYPE_AUDIO) {
-                    duration_pts = av_rescale_q(tmp_frame->nb_samples, {1, ctx->sample_rate}, st->time_base);
+                    duration_pts = av_rescale_q(av_frame->nb_samples, {1, ctx->sample_rate}, st->time_base);
                 }
             }
-
+            // CASPAR_LOG(info) << "12.4";
             if (duration_pts > 0) {
-                next_pts = tmp_frame->pts + duration_pts;
+                next_pts = av_frame->pts + duration_pts;
             } else {
                 next_pts = AV_NOPTS_VALUE;
             }
-
-            frame = std::move(tmp_frame);
+            // CASPAR_LOG(info) << "13: duration_pts = " << duration_pts << "; next_pts = " << next_pts;
+            frame = std::move(av_frame);
         }
 
         return true;
